@@ -1,0 +1,427 @@
+"""SQLite storage layer for dense fact embeddings.
+
+Manages a single table ``fact_embeddings`` in the same database file used by
+MemoryStore.  Intentionally kept separate from the holographic store so that:
+
+  - No schema changes are needed in the parent plugin.
+  - The table is lazily created on first use.
+  - The parent plugin remains unaware of embeddings.
+
+Table schema::
+
+    fact_embeddings (
+        fact_id   INTEGER NOT NULL,      -- FK to facts.fact_id (not enforced)
+        embedding BLOB NOT NULL,         -- numpy float32 bytes
+        dim       INTEGER NOT NULL,
+        embedding_identity TEXT NOT NULL,-- provider:model:role:prefix/version identity
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (fact_id, embedding_identity)
+    )
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+from contextlib import contextmanager
+from typing import List, Optional, Tuple
+
+import numpy as np
+
+from .embeddings import bytes_to_embedding, embedding_to_bytes
+from .sqlite_vec_index import SQLiteVecIndex
+
+logger = logging.getLogger(__name__)
+
+_CREATE_TABLE = """
+CREATE TABLE IF NOT EXISTS fact_embeddings (
+    fact_id    INTEGER NOT NULL,
+    embedding  BLOB NOT NULL,
+    dim        INTEGER NOT NULL,
+    embedding_identity TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (fact_id, embedding_identity)
+);
+"""
+
+_CREATE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_fact_embeddings_fact_id
+    ON fact_embeddings(fact_id);
+"""
+
+_CREATE_IDENTITY_DIM_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_fact_embeddings_identity_dim
+    ON fact_embeddings(embedding_identity, dim);
+"""
+
+
+class EmbedStore:
+    """CRUD for the fact_embeddings table.
+
+    Attaches to the same SQLite connection used by MemoryStore by accepting
+    either a path string or an existing ``sqlite3.Connection``.  Sharing the
+    connection avoids locking issues on WAL-mode databases.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        embedding_identity: Optional[str] = None,
+        lock: Optional["threading.RLock"] = None,
+    ) -> None:
+        self._conn = conn
+        # Share the parent store's lock when provided so embedding writes and the
+        # parent's fact writes serialize on the same connection (the RLock is
+        # reentrant, so nesting is safe). Falls back to a private lock for tests.
+        self._lock = lock if lock is not None else threading.RLock()
+        self._embedding_identity = embedding_identity
+        self._cache_ids: Optional[np.ndarray] = None
+        self._cache_matrix: Optional[np.ndarray] = None
+        self._cache_dim: Optional[int] = None
+        self._cache_identity: Optional[str] = None
+        self._cache_data_version: Optional[int] = None
+        self._init_table()
+        self._vector_index = SQLiteVecIndex.open_configured(conn, warn=False)
+
+    def _invalidate_cache(self) -> None:
+        """Drop the in-process embedding matrix cache after writes."""
+        self._cache_ids = None
+        self._cache_matrix = None
+        self._cache_dim = None
+        self._cache_identity = None
+        self._cache_data_version = None
+
+    @contextmanager
+    def _mutation(self):
+        """Keep canonical and derived writes atomic within any transaction."""
+        savepoint = "enfold_embed_store_mutation"
+        try:
+            self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+            except BaseException:
+                self._conn.execute(f"ROLLBACK TO {savepoint}")
+                self._conn.execute(f"RELEASE {savepoint}")
+                raise
+            else:
+                self._conn.execute(f"RELEASE {savepoint}")
+        finally:
+            self._invalidate_cache()
+
+    # ------------------------------------------------------------------
+    # Init
+    # ------------------------------------------------------------------
+
+    def _init_table(self) -> None:
+        owns_transaction = not self._conn.in_transaction
+        self._conn.execute(_CREATE_TABLE)
+        self._ensure_schema_v2()
+        self._conn.execute(_CREATE_INDEX)
+        self._conn.execute(_CREATE_IDENTITY_DIM_INDEX)
+        if owns_transaction:
+            self._conn.commit()
+
+    def _ensure_schema_v2(self) -> None:
+        """Migrate legacy one-vector-per-fact tables to identity-scoped rows.
+
+        Older Enfold builds used ``fact_id`` as the primary key and later
+        added nullable ``embedding_identity`` metadata. That was safe for
+        filtering, but not for side-by-side model shadowing because a second
+        model would overwrite the first. Schema v2 uses a composite primary key
+        so each fact can keep multiple vector spaces at once.
+        """
+        info = self._conn.execute("PRAGMA table_info(fact_embeddings)").fetchall()
+        cols = {row[1] for row in info}
+        if "embedding_identity" not in cols:
+            try:
+                self._conn.execute("ALTER TABLE fact_embeddings ADD COLUMN embedding_identity TEXT")
+            except sqlite3.OperationalError as exc:
+                # Two processes racing this same check-then-add on a fresh db
+                # (e.g. two MCP server instances starting against a brand new
+                # store at once): the loser's ALTER TABLE is a no-op, not a
+                # real failure.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+            info = self._conn.execute("PRAGMA table_info(fact_embeddings)").fetchall()
+
+        pk_cols = [row[1] for row in sorted(info, key=lambda row: row[5]) if row[5] > 0]
+        if pk_cols == ["fact_id", "embedding_identity"]:
+            return
+
+        legacy_name = "fact_embeddings_legacy_v1"
+        existing_tables = {
+            row[0]
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if legacy_name in existing_tables:
+            suffix = 1
+            while f"{legacy_name}_{suffix}" in existing_tables:
+                suffix += 1
+            legacy_name = f"{legacy_name}_{suffix}"
+
+        self._conn.execute(f"ALTER TABLE fact_embeddings RENAME TO {legacy_name}")
+        self._conn.execute(_CREATE_TABLE)
+        self._conn.execute(
+            f"""
+            INSERT OR REPLACE INTO fact_embeddings
+                (fact_id, embedding, dim, embedding_identity, created_at)
+            SELECT
+                fact_id,
+                embedding,
+                dim,
+                COALESCE(embedding_identity, 'ollama:qwen3-embedding:8b:document:none:v1'),
+                created_at
+            FROM {legacy_name}
+            """
+        )
+        self._conn.execute(f"DROP TABLE {legacy_name}")
+
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    def upsert(self, fact_id: int, vec: np.ndarray, embedding_identity: Optional[str] = None) -> None:
+        """Store or replace the embedding for *fact_id*."""
+        with self._lock:
+            with self._mutation():
+                vector = np.asarray(vec, dtype=np.float32)
+                if vector.ndim != 1 or vector.size == 0:
+                    raise ValueError("embedding vector must be a non-empty 1-D array")
+                if not np.all(np.isfinite(vector)):
+                    raise ValueError("embedding vector must contain only finite values")
+                blob = embedding_to_bytes(vector)
+                dim = len(vector)
+                identity = embedding_identity if embedding_identity is not None else self._embedding_identity
+                if not identity:
+                    identity = "legacy:unknown:document:none:v1"
+                self._conn.execute(
+                    """
+                    INSERT INTO fact_embeddings (fact_id, embedding, dim, embedding_identity)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(fact_id, embedding_identity) DO UPDATE SET
+                        embedding  = excluded.embedding,
+                        dim        = excluded.dim,
+                        embedding_identity = excluded.embedding_identity,
+                        created_at = CURRENT_TIMESTAMP
+                    """,
+                    (fact_id, blob, dim, identity),
+                )
+                if (
+                    self._vector_index is not None
+                    and identity == self._vector_index.identity
+                    and dim == self._vector_index.dimensions
+                ):
+                    self._vector_index.upsert_in_transaction(fact_id, blob)
+
+    def delete(self, fact_id: int) -> None:
+        """Remove embedding for *fact_id* (no-op if not present)."""
+        with self._lock:
+            with self._mutation():
+                self._conn.execute(
+                    "DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
+                )
+                if self._vector_index is not None:
+                    self._vector_index.delete_in_transaction(fact_id)
+
+    def prune_identities(self, keep) -> int:
+        """Delete every stored vector whose identity is not in *keep*.
+
+        *keep* is an iterable of embedding-identity strings to preserve (for
+        example the current document identity, optionally plus a canary model
+        running side by side). Refuses an empty *keep* (that would wipe every
+        vector) and raises ValueError instead. Returns the number of rows
+        deleted, and drops the matrix cache when anything was removed.
+        """
+        keep_list = [str(k) for k in keep]
+        if not keep_list:
+            raise ValueError("prune_identities requires a non-empty keep set")
+        with self._lock:
+            placeholders = ",".join("?" * len(keep_list))
+            with self._mutation():
+                cur = self._conn.execute(
+                    f"DELETE FROM fact_embeddings "
+                    f"WHERE embedding_identity NOT IN ({placeholders})",
+                    keep_list,
+                )
+                if (
+                    self._vector_index is not None
+                    and self._vector_index.identity not in keep_list
+                ):
+                    self._vector_index.clear_in_transaction()
+            deleted = int(cur.rowcount)
+        return deleted
+
+    def identity_counts(self) -> dict:
+        """Return ``{embedding_identity: row_count}`` across the whole table.
+
+        Useful for spotting vectors left behind by a superseded model: each
+        model swap adds a new identity, and the old one lingers until pruned.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT embedding_identity, COUNT(*) FROM fact_embeddings "
+                "GROUP BY embedding_identity"
+            ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    # ------------------------------------------------------------------
+    # Read
+    # ------------------------------------------------------------------
+
+    def ids_without_embeddings(self, all_fact_ids: List[int], embedding_identity: Optional[str] = None) -> List[int]:
+        """Return the subset of *all_fact_ids* that have no stored embedding."""
+        if not all_fact_ids:
+            return []
+        with self._lock:
+            identity = embedding_identity if embedding_identity is not None else self._embedding_identity
+            placeholders = ",".join("?" * len(all_fact_ids))
+            params = list(all_fact_ids)
+            identity_clause = ""
+            if identity:
+                if self._include_legacy_null_identity(identity):
+                    identity_clause = " AND (embedding_identity = ? OR embedding_identity IS NULL)"
+                    params.append(identity)
+                else:
+                    identity_clause = " AND embedding_identity = ?"
+                    params.append(identity)
+            rows = self._conn.execute(
+                f"SELECT fact_id FROM fact_embeddings WHERE fact_id IN ({placeholders}){identity_clause}",
+                params,
+            ).fetchall()
+            have_embeddings = {int(r[0]) for r in rows}
+            return [fid for fid in all_fact_ids if fid not in have_embeddings]
+
+    # ------------------------------------------------------------------
+    # Scoring helpers
+    # ------------------------------------------------------------------
+
+    def _identity_for_storage(self, identity: Optional[str]) -> Optional[str]:
+        """Map query/document identities to the stored document vector identity."""
+        identity = identity if identity is not None else self._embedding_identity
+        if identity:
+            return identity.replace(":query:", ":document:")
+        return identity
+
+    @staticmethod
+    def _include_legacy_null_identity(identity: Optional[str]) -> bool:
+        """Legacy rows belong to the historical qwen3-embedding:8b default only."""
+        return identity == "ollama:qwen3-embedding:8b:document:none:v1"
+
+    def _embedding_matrix(self, dim: int, embedding_identity: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Return cached (fact_ids, normalised_matrix) for embeddings matching dim/identity."""
+        identity = self._identity_for_storage(embedding_identity)
+        with self._lock:
+            data_version = int(
+                self._conn.execute("PRAGMA data_version").fetchone()[0]
+            )
+            if (
+                self._cache_ids is not None
+                and self._cache_matrix is not None
+                and self._cache_dim == dim
+                and self._cache_identity == identity
+                and self._cache_data_version == data_version
+            ):
+                return self._cache_ids, self._cache_matrix
+
+            if identity:
+                if self._include_legacy_null_identity(identity):
+                    rows = self._conn.execute(
+                        """
+                        SELECT fact_id, embedding FROM fact_embeddings
+                        WHERE dim = ?
+                          AND (embedding_identity = ? OR embedding_identity IS NULL)
+                        ORDER BY fact_id DESC
+                        """,
+                        (dim, identity),
+                    ).fetchall()
+                else:
+                    rows = self._conn.execute(
+                        """
+                        SELECT fact_id, embedding FROM fact_embeddings
+                        WHERE dim = ? AND embedding_identity = ?
+                        ORDER BY fact_id DESC
+                        """,
+                        (dim, identity),
+                    ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT fact_id, embedding FROM fact_embeddings "
+                    "WHERE dim = ? ORDER BY fact_id DESC",
+                    (dim,),
+                ).fetchall()
+            valid_rows = []
+            for fact_id, blob in rows:
+                try:
+                    vector = bytes_to_embedding(blob)
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "Skipping embedding for fact %s: malformed blob for dim %s",
+                        fact_id,
+                        dim,
+                    )
+                    continue
+                if len(vector) != dim:
+                    logger.debug(
+                        "Skipping embedding for fact %s: blob length %s disagrees with dim %s",
+                        fact_id,
+                        len(vector),
+                        dim,
+                    )
+                    continue
+                valid_rows.append((fact_id, vector))
+
+            if not valid_rows:
+                self._cache_ids = np.array([], dtype=np.int64)
+                self._cache_matrix = np.empty((0, dim), dtype=np.float32)
+                self._cache_dim = dim
+                self._cache_identity = identity
+                self._cache_data_version = data_version
+                return self._cache_ids, self._cache_matrix
+
+            fact_ids = np.array([int(r[0]) for r in valid_rows], dtype=np.int64)
+            matrix = np.stack([r[1] for r in valid_rows]).astype(np.float32, copy=False)
+
+            row_norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            row_norms = np.where(row_norms < 1e-9, 1.0, row_norms)
+            matrix_normed = matrix / row_norms
+
+            self._cache_ids = fact_ids
+            self._cache_matrix = matrix_normed
+            self._cache_dim = dim
+            self._cache_identity = identity
+            self._cache_data_version = data_version
+            return self._cache_ids, self._cache_matrix
+
+    def score_all(
+        self, query_vec: np.ndarray, embedding_identity: Optional[str] = None
+    ) -> List[Tuple[int, float]]:
+        """Compute cosine similarity between *query_vec* and every stored embedding.
+
+        Returns a list of (fact_id, similarity) pairs sorted by similarity desc.
+        Similarity is in [-1, 1] but practically [0, 1] for pre-normalised vectors.
+        Only embeddings with the same dimension as *query_vec* are scored; this
+        avoids crashes during canary/migration periods with mixed dimensions.
+        """
+        if query_vec is None or len(query_vec) == 0:
+            return []
+
+        q = query_vec.astype(np.float32, copy=False)
+        q_norm = np.linalg.norm(q)
+        if q_norm > 1e-9:
+            q = q / q_norm
+
+        fact_ids, matrix_normed = self._embedding_matrix(len(q), embedding_identity=embedding_identity)
+        if matrix_normed.size == 0:
+            return []
+
+        sims = matrix_normed @ q  # (N,)
+
+        result = sorted(
+            zip(fact_ids.astype(int).tolist(), sims.astype(float).tolist()),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return result

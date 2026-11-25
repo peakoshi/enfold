@@ -1,0 +1,11 @@
+name: enfold-legacy-hermes
+version: 0.8.1
+description: "Hermes compatibility extra only. Not the public Enfold contract. Use enfold-mcp-launch / enfold.mcp_stdio (core profile: memory_recall, memory_remember, memory_inspect)."
+# Informational only. The memory-provider loader (plugins/memory/__init__.py)
+# reads just the description above; provider hooks are invoked through the
+# MemoryProvider ABC by MemoryManager, not from this manifest.
+# This file is not an MCP tool contract.
+provides_hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
